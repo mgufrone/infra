@@ -3,3 +3,5 @@
 *.tfstate
 *.backup
 kubeconfig
+vars.tfvars
+.idea

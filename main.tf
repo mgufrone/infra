@@ -12,10 +12,6 @@ terraform {
       source  = "hashicorp/helm"
       version = ">= 2.0.1"
     }
-    kubectl = {
-      source  = "gavinbunney/kubectl"
-      version = ">= 1.7.0"
-    }
   }
 }
 
@@ -73,7 +69,20 @@ resource "helm_release" "nginx_ingress" {
   repository = "https://charts.bitnami.com/bitnami"
   set {
     name = "service.type"
-    value = "ClusterIP"
+    value = "LoadBalancer"
+  }
+  set {
+    name = "podAnnotations"
+    value = <<EOT
+prometheus.io/scrape: "true"
+prometheus.io/port: "10254"
+prometheus.io/scheme: "http"
+prometheus.io/path: "/metrics"
+EOT
+  }
+  set {
+    name = "metrics.enabled"
+    value = "true"
   }
 }
 
@@ -100,24 +109,30 @@ resource "helm_release" "kubernetes_dashboard" {
   }
   set {
     name = "ingress.hosts.0"
-    value = "dashboard.dev.mgufron.com"
+    value = var.dashboard_host
   }
 }
 
-resource "helm_release" "vault" {
-  depends_on = [digitalocean_kubernetes_cluster.dev-cluster]
-  chart = "vault"
-  repository = "https://helm.releases.hashicorp.com"
-  name = "vault"
-  namespace = "cert-manager"
+resource "helm_release" "metrics_server" {
+  depends_on = [local_file.kubeconfig]
   dependency_update = true
+  name = "kube-state-metrics"
+  chart = "kube-state-metrics"
+  namespace = "kube-system"
+  repository = "https://prometheus-community.github.io/helm-charts"
+  create_namespace = true
 }
-
 
 resource "null_resource" "cert_manager_provision" {
   depends_on = [digitalocean_kubernetes_cluster.dev-cluster]
   provisioner "local-exec" {
     command = "kubectl --kubeconfig=${path.root}/kubeconfig apply -f https://github.com/jetstack/cert-manager/releases/download/v1.4.0/cert-manager.crds.yaml"
+  }
+}
+resource "null_resource" "metric_server_provision" {
+  depends_on = [digitalocean_kubernetes_cluster.dev-cluster]
+  provisioner "local-exec" {
+    command = "kubectl --kubeconfig=${path.root}/kubeconfig apply -f  https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml"
   }
 }
 
@@ -128,20 +143,38 @@ resource "null_resource" "weave_provision" {
   }
 }
 
-resource "null_resource" "vault_unseal" {
-  depends_on = [helm_release.vault]
-  provisioner "local-exec" {
-    command = "kubectl --kubeconfig=${path.root}/kubeconfig exec -n cert-manager $(kubectl --kubeconfig=${path.root}/kubeconfig get pods -n cert-manager --selector \"app.kubernetes.io/name=vault\" --output=name) vault operator init -recovery-shares=7 -recovery-threshold=4 -recovery-pgp-keys=\"keybase:gufy,keybase:jenkins\" -root-token-pgp-key=\"keybase:gufy\""
-  }
-}
-
 resource "helm_release" "jenkins" {
   depends_on = [helm_release.nginx_ingress]
   chart = "jenkins"
   repository = "https://charts.jenkins.io"
   name = "jenkins"
   namespace = "default"
-  dependency_update = true
+  set {
+    name = "agent.podTemplates.deployment"
+    value = <<EOT
+- name: deployment
+  label: jenkins-deployment
+  containers:
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:debug
+    command: "sleep"
+    args: "infinity"
+    ttyEnabled: true
+    privileged: false
+  - name: helm
+    image: alpine/helm:latest
+    command: "sleep"
+    args: "infinity"
+    ttyEnabled: true
+    privileged: false
+  - name: kubectl
+    image: bitnami/kubectl:1.21.2
+    command: "sleep"
+    args: "infinity"
+    ttyEnabled: true
+    privileged: false
+EOT
+  }
   set {
     name = "agent.podTemplates.composer"
     value = <<EOT
@@ -150,8 +183,8 @@ resource "helm_release" "jenkins" {
   containers:
   - name: composer
     image: composer:2.1.3
-    command: "/bin/sh -c"
-    args: "cat"
+    command: "sleep"
+    args: "infinity"
     ttyEnabled: true
     privileged: false
     resourceRequestCpu: 400m
@@ -159,7 +192,10 @@ resource "helm_release" "jenkins" {
     resourceLimitCpu: "1"
     resourceLimitMemory: "1024Mi"
 EOT
-
+  }
+  set {
+    name = "controller.installPlugins"
+    value = "false"
   }
   set {
     name = "controller.ingress.enabled"
@@ -167,7 +203,31 @@ EOT
   }
   set {
     name = "controller.ingress.hostName"
-    value = "jenkins.dev.mgufron.com"
+    value = var.jenkins_host
+  }
+  set {
+    name = "controller.image"
+    value = "mgufrone/jenkins-plugin"
+  }
+  set {
+    name = "controller.tag"
+    value = "1.1.0"
+  }
+  set {
+    name = "controller.initContainerEnv[0].name"
+    value = "JENKINS_UC"
+  }
+  set {
+    name = "controller.initContainerEnv[0].value"
+    value = var.jenkins_update_center
+  }
+  set {
+    name = "controller.containerEnv[0].name"
+    value = "JENKINS_UC"
+  }
+  set {
+    name = "controller.containerEnv[0].value"
+    value = var.jenkins_update_center
   }
   set_sensitive {
     name = "controller.JCasC.configScripts.jenkins-casc-configs"
@@ -179,9 +239,36 @@ credentials:
       - usernamePassword:
           description: "github creds"
           id: "github"
-          password: ${var.github_username}
+          password: ${var.github_password}
           scope: GLOBAL
-          username: ${var.github_password}
+          username: ${var.github_username}
 EOT
+  }
+}
+
+resource "helm_release" "prometheus" {
+  depends_on = [local_file.kubeconfig]
+  dependency_update = true
+  name = "prometheus"
+  chart = "prometheus"
+  namespace = "kube-system"
+  repository = "https://prometheus-community.github.io/helm-charts"
+  create_namespace = true
+}
+resource "helm_release" "grafana" {
+  depends_on = [local_file.kubeconfig]
+  dependency_update = true
+  name = "grafana"
+  chart = "grafana"
+  namespace = "kube-system"
+  repository = "https://grafana.github.io/helm-charts"
+  create_namespace = true
+  set {
+    name = "ingress.enabled"
+    value = "true"
+  }
+  set {
+    name = "ingress.hosts[0]"
+    value = var.grafana_host
   }
 }
